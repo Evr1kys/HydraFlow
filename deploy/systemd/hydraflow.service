@@ -11,8 +11,7 @@ Type=simple
 User=hydraflow
 Group=hydraflow
 
-ExecStart=/usr/local/bin/hf-server --config /etc/hydraflow/config.yml
-ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=/usr/local/bin/hydraflow serve --config /etc/hydraflow/hydraflow.yaml
 
 Restart=on-failure
 RestartSec=5s

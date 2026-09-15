@@ -57,7 +57,7 @@ func cmdServe() {
 	// Create the smart subscription engine.
 	engine := smartsub.NewEngine(smartsub.EngineConfig{
 		Token:    cfg.AdminToken,
-		ServerIP: detectServerIP(cfg.Listen),
+		ServerIP: serverAddress(cfg),
 		Logger:   logger,
 	})
 
@@ -137,47 +137,15 @@ func serveStandalone(ctx context.Context, cfg *config.Config, engine *smartsub.E
 		ConfigPath: cfg.Standalone.XrayConfig,
 	}, logger)
 
-	// Build xray config from users.
-	builder := mgr.Builder()
-
-	// Add a default Reality inbound.
-	builder.AddInbound(xray.InboundConfig{
-		Tag:                "vless-reality",
-		Type:               xray.InboundVLESSReality,
-		Port:               443,
-		RealityDest:        "www.microsoft.com:443",
-		RealityServerNames: []string{"www.microsoft.com"},
-		Flow:               "xtls-rprx-vision",
-	})
-
-	// Add users to inbound.
-	var nodes []smartsub.Node
-	for _, u := range users {
-		if !u.Enabled {
-			continue
-		}
-		builder.AddUser("vless-reality", u.Email, u.UUID)
-
-		nodes = append(nodes, smartsub.Node{
-			Name:        "HydraFlow-Reality",
-			Server:      detectServerIP(cfg.Listen),
-			Port:        443,
-			Protocol:    "reality",
-			UUID:        u.UUID,
-			Email:       u.Email,
-			Enabled:     true,
-			SNI:         "www.microsoft.com",
-			Flow:        "xtls-rprx-vision",
-			Fingerprint: "chrome",
-			ServerName:  "local",
-		})
+	if err := ensureReality(cfg, getConfigPath()); err != nil {
+		return err
 	}
-
+	nodes := configureStandalone(cfg, users, mgr.Builder())
 	engine.SetNodes(nodes)
 
 	// Start xray.
 	if err := mgr.Start(); err != nil {
-		logger.Warn("failed to start xray (continuing without it)", "error", err)
+		return fmt.Errorf("start xray: %w", err)
 	} else {
 		defer mgr.Close()
 	}
@@ -197,7 +165,7 @@ func serve3XUI(ctx context.Context, cfg *config.Config, engine *smartsub.Engine,
 	provider, err := integrations.NewXUIProvider(integrations.XUIConfig{
 		DatabasePath: cfg.XUI.Database,
 		PollInterval: time.Duration(cfg.XUI.PollInterval) * time.Second,
-		ServerIP:     detectServerIP(cfg.Listen),
+		ServerIP:     serverAddress(cfg),
 		Logger:       logger,
 		OnChange: func(nodes []smartsub.Node) {
 			engine.SetNodes(nodes)
@@ -228,7 +196,7 @@ func serveMarzban(ctx context.Context, cfg *config.Config, engine *smartsub.Engi
 		APIURL:       cfg.Marzban.APIURL,
 		APIToken:     cfg.Marzban.APIToken,
 		PollInterval: 30 * time.Second,
-		ServerIP:     detectServerIP(cfg.Listen),
+		ServerIP:     serverAddress(cfg),
 		Logger:       logger,
 		OnChange: func(nodes []smartsub.Node) {
 			engine.SetNodes(nodes)
@@ -255,7 +223,7 @@ func serveRemnawave(ctx context.Context, cfg *config.Config, engine *smartsub.En
 		APIURL:       cfg.Remnawave.APIURL,
 		APIToken:     cfg.Remnawave.APIToken,
 		PollInterval: 30 * time.Second,
-		ServerIP:     detectServerIP(cfg.Listen),
+		ServerIP:     serverAddress(cfg),
 		Logger:       logger,
 		OnChange: func(nodes []smartsub.Node) {
 			engine.SetNodes(nodes)
@@ -282,7 +250,7 @@ func serveHiddify(ctx context.Context, cfg *config.Config, engine *smartsub.Engi
 		APIURL:       cfg.Hiddify.APIURL,
 		APIToken:     cfg.Hiddify.APIToken,
 		PollInterval: 30 * time.Second,
-		ServerIP:     detectServerIP(cfg.Listen),
+		ServerIP:     serverAddress(cfg),
 		Logger:       logger,
 		OnChange: func(nodes []smartsub.Node) {
 			engine.SetNodes(nodes)
@@ -324,7 +292,7 @@ func startHTTPServer(ctx context.Context, cfg *config.Config, engine *smartsub.E
 	logger.Info("smart subscription server started",
 		"addr", cfg.Listen,
 		"mode", cfg.Mode,
-		"sub_url", fmt.Sprintf("http://<server>:%s/sub/%s", portFromListen(cfg.Listen), cfg.AdminToken),
+		"subscriptions", "use hydraflow user sub <email> to issue a user link",
 	)
 
 	errCh := make(chan error, 1)
@@ -369,51 +337,19 @@ func watchUsersFile(ctx context.Context, cfg *config.Config, engine *smartsub.En
 				continue
 			}
 			if info.ModTime().After(lastMod) {
-				lastMod = info.ModTime()
 				users, err := loadUsers(cfg.Standalone.UsersFile)
 				if err != nil {
 					logger.Error("reload users failed", "error", err)
 					continue
 				}
 
-				// Rebuild nodes.
-				var nodes []smartsub.Node
-				builder := mgr.Builder()
-				builder.Reset()
-				builder.AddInbound(xray.InboundConfig{
-					Tag:                "vless-reality",
-					Type:               xray.InboundVLESSReality,
-					Port:               443,
-					RealityDest:        "www.microsoft.com:443",
-					RealityServerNames: []string{"www.microsoft.com"},
-					Flow:               "xtls-rprx-vision",
-				})
-				for _, u := range users {
-					if !u.Enabled {
-						continue
-					}
-					builder.AddUser("vless-reality", u.Email, u.UUID)
-
-					nodes = append(nodes, smartsub.Node{
-						Name:        "HydraFlow-Reality",
-						Server:      detectServerIP(cfg.Listen),
-						Port:        443,
-						Protocol:    "reality",
-						UUID:        u.UUID,
-						Email:       u.Email,
-						Enabled:     true,
-						SNI:         "www.microsoft.com",
-						Flow:        "xtls-rprx-vision",
-						Fingerprint: "chrome",
-						ServerName:  "local",
-					})
-				}
-				engine.SetNodes(nodes)
-
-				// Reload xray config.
+				nodes := configureStandalone(cfg, users, mgr.Builder())
 				if err := mgr.Reload(); err != nil {
 					logger.Error("xray reload failed", "error", err)
+					continue
 				}
+				engine.SetNodes(nodes)
+				lastMod = info.ModTime()
 
 				logger.Info("users reloaded", "count", len(users))
 			}

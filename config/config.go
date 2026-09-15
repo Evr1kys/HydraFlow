@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"gopkg.in/yaml.v3"
 )
@@ -32,10 +33,11 @@ const (
 
 // Config is the top-level HydraFlow configuration.
 type Config struct {
-	Mode       Mode   `yaml:"mode"`
-	Listen     string `yaml:"listen"`
-	AdminToken string `yaml:"admin_token"`
-	LogLevel   string `yaml:"log_level"`
+	Mode          Mode   `yaml:"mode"`
+	Listen        string `yaml:"listen"`
+	AdminToken    string `yaml:"admin_token"`
+	LogLevel      string `yaml:"log_level"`
+	ServerAddress string `yaml:"server_address,omitempty"`
 
 	Standalone StandaloneConfig `yaml:"standalone"`
 	XUI        XUIConfig        `yaml:"xui"`
@@ -49,9 +51,11 @@ type Config struct {
 
 // StandaloneConfig holds settings for standalone mode with built-in xray management.
 type StandaloneConfig struct {
-	XrayBinary string `yaml:"xray_binary"`
-	XrayConfig string `yaml:"xray_config"`
-	UsersFile  string `yaml:"users_file"`
+	XrayBinary        string `yaml:"xray_binary"`
+	XrayConfig        string `yaml:"xray_config"`
+	UsersFile         string `yaml:"users_file"`
+	RealityPrivateKey string `yaml:"reality_private_key,omitempty"`
+	RealityShortID    string `yaml:"reality_short_id,omitempty"`
 }
 
 // XUIConfig holds settings for 3x-ui integration mode.
@@ -121,7 +125,8 @@ func DefaultConfig() *Config {
 }
 
 // Load reads the configuration from a YAML file.
-// If the file does not exist, it returns the default config.
+// If the file or admin token is missing, defaults and a generated secret are
+// saved atomically before returning. The configuration directory must be writable.
 func Load(path string) (*Config, error) {
 	if path == "" {
 		path = DefaultConfigPath
@@ -130,7 +135,11 @@ func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return DefaultConfig(), nil
+			cfg := DefaultConfig()
+			if err := ensureToken(cfg, path); err != nil {
+				return nil, err
+			}
+			return cfg, nil
 		}
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
@@ -154,8 +163,8 @@ func Load(path string) (*Config, error) {
 		cfg.Listen = DefaultListen
 	}
 
-	if cfg.AdminToken == "" {
-		cfg.AdminToken = generateToken()
+	if err := ensureToken(cfg, path); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil
@@ -176,28 +185,40 @@ func Save(cfg *Config, path string) error {
 		return fmt.Errorf("create config dir: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0640); err != nil {
-		return fmt.Errorf("write config %s: %w", path, err)
+	tmp, err := os.CreateTemp(dirOf(path), ".hydraflow-*.yaml")
+	if err != nil {
+		return fmt.Errorf("create config: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return fmt.Errorf("save config: %w", err)
 	}
 
 	return nil
 }
 
-// generateToken creates a random hex token.
-func generateToken() string {
+// ensureToken persists the secret before issuing any subscription URLs.
+func ensureToken(cfg *Config, path string) error {
+	if cfg.AdminToken != "" {
+		return nil
+	}
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return "change-me-please"
+		return fmt.Errorf("generate admin token: %w", err)
 	}
-	return hex.EncodeToString(b)
+	cfg.AdminToken = hex.EncodeToString(b)
+	return Save(cfg, path)
 }
 
-// dirOf returns the directory portion of a file path.
-func dirOf(path string) string {
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '/' {
-			return path[:i]
-		}
-	}
-	return "."
-}
+func dirOf(path string) string { return filepath.Dir(path) }

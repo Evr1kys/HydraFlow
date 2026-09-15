@@ -115,8 +115,30 @@ func (m *XrayManager) GenerateConfig() ([]byte, error) {
 		return nil, fmt.Errorf("create config dir %s: %w", dir, err)
 	}
 
-	if err := os.WriteFile(m.config.ConfigPath, data, 0640); err != nil {
-		return nil, fmt.Errorf("write config to %s: %w", m.config.ConfigPath, err)
+	// Validate a private temporary file before replacing the live configuration.
+	tmp, err := os.CreateTemp(dir, ".xray-*.json")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	defer cancel()
+	check := exec.CommandContext(ctx, m.config.XrayPath, "run", "-test", "-c", tmp.Name())
+	if m.config.AssetPath != "" {
+		check.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+m.config.AssetPath)
+	}
+	if output, err := check.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("validate xray config: %w: %s", err, output)
+	}
+	if err := os.Rename(tmp.Name(), m.config.ConfigPath); err != nil {
+		return nil, fmt.Errorf("save xray config: %w", err)
 	}
 
 	m.logger.Info("xray config generated", "path", m.config.ConfigPath, "size", len(data))

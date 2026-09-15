@@ -28,6 +28,8 @@
 
 ---
 
+Upgrading an existing CLI deployment? Read the [subscription migration guide](docs/upgrade-subscriptions.md).
+
 ## Install
 
 Install on any VPS with Debian, Ubuntu, or CentOS:
