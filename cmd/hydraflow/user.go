@@ -2,9 +2,12 @@ package main
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 
 	"github.com/Evr1kys/HydraFlow/config"
+	"github.com/Evr1kys/HydraFlow/smartsub"
 	"github.com/Evr1kys/HydraFlow/xray"
 )
 
@@ -22,7 +25,7 @@ func cmdUser() {
 		os.Exit(1)
 	}
 
-	if cfg.Mode != config.ModeStandalone {
+	if cfg.Mode != config.ModeStandalone && os.Args[2] != "sub" {
 		fmt.Fprintf(os.Stderr, "user management is only available in standalone mode (current: %s)\n", cfg.Mode)
 		os.Exit(1)
 	}
@@ -57,16 +60,15 @@ func cmdUserAdd(cfg *config.Config) {
 		os.Exit(1)
 	}
 
-	serverIP := detectServerIP(cfg.Listen)
+	serverIP := serverAddress(cfg)
 
 	fmt.Printf("User added:\n")
 	fmt.Printf("  Email: %s\n", user.Email)
 	fmt.Printf("  UUID:  %s\n", user.UUID)
 	fmt.Printf("\n")
-	fmt.Printf("  Subscription URL: http://%s:%s/sub/%s/%s\n", serverIP,
-		portFromListen(cfg.Listen), cfg.AdminToken, user.Email)
+	fmt.Printf("  Subscription URL: %s\n", userSubscriptionURL(cfg, serverIP, user.Email))
 	fmt.Printf("\n")
-	fmt.Printf("  Restart HydraFlow to apply: systemctl restart hydraflow\n")
+	fmt.Printf("  Running HydraFlow reloads users automatically within 10 seconds.\n")
 }
 
 func cmdUserList(cfg *config.Config) {
@@ -129,7 +131,7 @@ func cmdUserDel(cfg *config.Config) {
 	}
 
 	fmt.Printf("User %s removed.\n", email)
-	fmt.Printf("Restart HydraFlow to apply: systemctl restart hydraflow\n")
+	fmt.Printf("Running HydraFlow reloads users automatically within 10 seconds.\n")
 }
 
 func cmdUserSub(cfg *config.Config) {
@@ -140,34 +142,34 @@ func cmdUserSub(cfg *config.Config) {
 
 	email := os.Args[3]
 
-	// Verify user exists.
-	users, err := loadUsers(cfg.Standalone.UsersFile)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
-
-	found := false
-	for _, u := range users {
-		if u.Email == email {
-			found = true
-			break
+	// Standalone users are local; panel-mode identities come from the provider.
+	if cfg.Mode == config.ModeStandalone {
+		users, err := loadUsers(cfg.Standalone.UsersFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
 		}
+
+		found := false
+		for _, u := range users {
+			if u.Email == email && u.Enabled {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			fmt.Fprintf(os.Stderr, "user %q not found\n", email)
+			os.Exit(1)
+		}
+
 	}
-
-	if !found {
-		fmt.Fprintf(os.Stderr, "user %q not found\n", email)
-		os.Exit(1)
-	}
-
-	port := portFromListen(cfg.Listen)
-	serverIP := detectServerIP(cfg.Listen)
-
+	link := userSubscriptionURL(cfg, serverAddress(cfg), email)
 	fmt.Printf("Subscription URLs for %s:\n\n", email)
-	fmt.Printf("  Universal:  http://%s:%s/sub/%s/%s\n", serverIP, port, cfg.AdminToken, email)
-	fmt.Printf("  V2Ray:      http://%s:%s/sub/%s/%s?format=v2ray\n", serverIP, port, cfg.AdminToken, email)
-	fmt.Printf("  Clash:      http://%s:%s/sub/%s/%s?format=clash\n", serverIP, port, cfg.AdminToken, email)
-	fmt.Printf("  sing-box:   http://%s:%s/sub/%s/%s?format=singbox\n", serverIP, port, cfg.AdminToken, email)
+	fmt.Printf("  Universal:  %s\n", link)
+	fmt.Printf("  V2Ray:      %s?format=v2ray\n", link)
+	fmt.Printf("  Clash:      %s?format=clash\n", link)
+	fmt.Printf("  sing-box:   %s?format=singbox\n", link)
 	fmt.Printf("\n")
 	fmt.Printf("  The format is auto-detected from User-Agent if not specified.\n")
 }
@@ -191,4 +193,8 @@ func formatBytes(b int64) string {
 		exp = len(suffix) - 1
 	}
 	return fmt.Sprintf("%.1f %s", float64(b)/float64(div), suffix[exp])
+}
+
+func userSubscriptionURL(cfg *config.Config, host, email string) string {
+	return "http://" + net.JoinHostPort(host, portFromListen(cfg.Listen)) + "/sub/" + smartsub.SubscriptionToken(cfg.AdminToken, email) + "/" + url.PathEscape(email)
 }

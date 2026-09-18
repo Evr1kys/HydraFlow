@@ -2,6 +2,7 @@ package xray
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -53,19 +54,24 @@ type XrayManager struct {
 	logger  *slog.Logger
 	builder *ConfigBuilder
 
-	cmd       *exec.Cmd
-	process   *os.Process
-	startedAt time.Time
-	running   bool
-	version   string
+	cmd         *exec.Cmd
+	process     *os.Process
+	startedAt   time.Time
+	running     bool
+	wantRunning bool
+	version     string
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	// waitDone is closed when cmd.Wait() has been called exactly once by monitor().
-	// Stop() selects on this channel instead of calling Wait() a second time.
+	// Stop waits on this channel without holding mu.
 	waitDone chan struct{}
 	waitErr  error
+
+	// Kept configurable inside the package so lifecycle tests do not need to
+	// sleep for the production restart interval.
+	restartDelay time.Duration
 }
 
 // NewManager creates a new XrayManager.
@@ -86,11 +92,12 @@ func NewManager(cfg ManagerConfig, logger *slog.Logger) *XrayManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &XrayManager{
-		config:  cfg,
-		logger:  logger,
-		builder: NewConfigBuilder(),
-		ctx:     ctx,
-		cancel:  cancel,
+		config:       cfg,
+		logger:       logger,
+		builder:      NewConfigBuilder(),
+		ctx:          ctx,
+		cancel:       cancel,
+		restartDelay: 3 * time.Second,
 	}
 }
 
@@ -115,8 +122,34 @@ func (m *XrayManager) GenerateConfig() ([]byte, error) {
 		return nil, fmt.Errorf("create config dir %s: %w", dir, err)
 	}
 
-	if err := os.WriteFile(m.config.ConfigPath, data, 0640); err != nil {
-		return nil, fmt.Errorf("write config to %s: %w", m.config.ConfigPath, err)
+	// Validate a private temporary file before replacing the live configuration.
+	tmp, err := os.CreateTemp(dir, ".xray-*.json")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return nil, fmt.Errorf("secure temporary xray config: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	defer cancel()
+	check := exec.CommandContext(ctx, m.config.XrayPath, "run", "-test", "-c", tmp.Name())
+	if m.config.AssetPath != "" {
+		check.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+m.config.AssetPath)
+	}
+	if output, err := check.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("validate xray config: %w: %s", err, output)
+	}
+	if err := os.Rename(tmp.Name(), m.config.ConfigPath); err != nil {
+		return nil, fmt.Errorf("save xray config: %w", err)
 	}
 
 	m.logger.Info("xray config generated", "path", m.config.ConfigPath, "size", len(data))
@@ -128,8 +161,33 @@ func (m *XrayManager) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.wantRunning = true
 	if m.running {
 		return fmt.Errorf("xray is already running")
+	}
+	if err := m.startLocked(); err != nil {
+		m.wantRunning = false
+		return err
+	}
+	return nil
+}
+
+// startIfWanted is used by the crash monitor. It never overrides a concurrent
+// Stop request, because wantRunning is checked while holding mu.
+func (m *XrayManager) startIfWanted() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.wantRunning || m.ctx.Err() != nil || m.running {
+		return nil
+	}
+	return m.startLocked()
+}
+
+// startLocked starts xray while mu is held.
+func (m *XrayManager) startLocked() error {
+	if m.ctx.Err() != nil {
+		return fmt.Errorf("xray manager is closed")
 	}
 
 	// Generate config before starting.
@@ -140,9 +198,7 @@ func (m *XrayManager) Start() error {
 	// Detect xray version.
 	m.detectVersion()
 
-	// Build command.
 	args := []string{"run", "-c", m.config.ConfigPath}
-
 	cmd := exec.CommandContext(m.ctx, m.config.XrayPath, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -158,11 +214,14 @@ func (m *XrayManager) Start() error {
 		return fmt.Errorf("start xray: %w", err)
 	}
 
+	startedAt := time.Now()
+	done := make(chan struct{})
 	m.cmd = cmd
 	m.process = cmd.Process
-	m.startedAt = time.Now()
+	m.startedAt = startedAt
 	m.running = true
-	m.waitDone = make(chan struct{})
+	m.waitDone = done
+	m.waitErr = nil
 
 	m.logger.Info("xray-core started",
 		"pid", cmd.Process.Pid,
@@ -170,8 +229,8 @@ func (m *XrayManager) Start() error {
 		"version", m.version,
 	)
 
-	// Monitor process in background.
-	go m.monitor()
+	// Pass process-specific values so an old monitor cannot affect a newer run.
+	go m.monitor(cmd, done, startedAt)
 
 	return nil
 }
@@ -179,40 +238,47 @@ func (m *XrayManager) Start() error {
 // Stop gracefully stops the xray-core process.
 func (m *XrayManager) Stop() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	m.wantRunning = false
 	if !m.running || m.process == nil {
+		m.mu.Unlock()
 		return nil
 	}
+	process := m.process
+	done := m.waitDone
+	pid := process.Pid
+	m.mu.Unlock()
 
-	m.logger.Info("stopping xray-core", "pid", m.process.Pid)
+	m.logger.Info("stopping xray-core", "pid", pid)
 
-	// Send SIGTERM first for graceful shutdown.
-	if err := m.process.Signal(syscall.SIGTERM); err != nil {
+	// Never hold mu while waiting: monitor needs it before it can close done.
+	if err := process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		m.logger.Warn("SIGTERM failed, sending SIGKILL", "error", err)
-		if killErr := m.process.Kill(); killErr != nil {
+		if killErr := process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
 			return fmt.Errorf("kill xray: %w", killErr)
 		}
 	}
 
-	// Wait for monitor() to observe the process exit (it calls cmd.Wait()
-	// exactly once). We do NOT call cmd.Wait() here to avoid a double-wait panic.
 	select {
-	case <-m.waitDone:
-		if m.waitErr != nil {
-			m.logger.Debug("xray exited with error", "error", m.waitErr)
-		}
+	case <-done:
 	case <-time.After(10 * time.Second):
-		m.logger.Warn("xray did not stop gracefully, killing")
-		m.process.Kill()
-		<-m.waitDone // wait for monitor to finish after kill
+		m.logger.Warn("xray did not stop gracefully, killing", "pid", pid)
+		if err := process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			return fmt.Errorf("kill unresponsive xray: %w", err)
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			return fmt.Errorf("xray process %d did not exit after SIGKILL", pid)
+		}
 	}
 
-	m.running = false
-	m.process = nil
-	m.cmd = nil
-	m.logger.Info("xray-core stopped")
-
+	m.mu.RLock()
+	waitErr := m.waitErr
+	m.mu.RUnlock()
+	if waitErr != nil {
+		m.logger.Debug("xray exited while stopping", "error", waitErr)
+	}
+	m.logger.Info("xray-core stopped", "pid", pid)
 	return nil
 }
 
@@ -224,27 +290,25 @@ func (m *XrayManager) Restart() error {
 	return m.Start()
 }
 
-// Reload triggers a hot-reload of the xray configuration by sending
-// SIGUSR1 to the xray process, which causes it to re-read its config.
+// Reload validates and writes the new configuration, then restarts xray.
 // If the process is not running, it starts it instead.
 func (m *XrayManager) Reload() error {
 	m.mu.RLock()
 	running := m.running
-	process := m.process
 	m.mu.RUnlock()
 
-	if !running || process == nil {
+	if !running {
 		m.logger.Info("xray not running, starting instead of reloading")
 		return m.Start()
 	}
 
-	// Regenerate config first.
+	// Validate the candidate before interrupting the working process.
 	if _, err := m.GenerateConfig(); err != nil {
 		return fmt.Errorf("regenerate config for reload: %w", err)
 	}
 
-	// xray-core does not support SIGUSR1 for reload; perform restart.
-	m.logger.Info("reloading xray-core (restart)", "pid", process.Pid)
+	// xray-core does not support a reliable in-process config reload.
+	m.logger.Info("reloading xray-core (restart)")
 	return m.Restart()
 }
 
@@ -269,51 +333,50 @@ func (m *XrayManager) Status() ProcessStatus {
 
 // Close shuts down the manager and stops the xray process.
 func (m *XrayManager) Close() error {
+	err := m.Stop()
 	m.cancel()
-	return m.Stop()
+	return err
 }
 
-// monitor watches the xray subprocess and logs if it exits unexpectedly.
-// It is the only goroutine that calls cmd.Wait(), and it signals completion
-// via m.waitDone so that Stop() never double-waits.
-func (m *XrayManager) monitor() {
-	if m.cmd == nil {
-		return
-	}
-
-	err := m.cmd.Wait()
+// monitor watches one xray subprocess. It is the only goroutine that calls
+// cmd.Wait(), and it always closes the matching done channel exactly once.
+func (m *XrayManager) monitor(cmd *exec.Cmd, done chan struct{}, startedAt time.Time) {
+	err := cmd.Wait()
 
 	m.mu.Lock()
-	m.running = false
-	m.waitErr = err
+	isCurrent := m.cmd == cmd
+	intentional := !m.wantRunning || m.ctx.Err() != nil
+	if isCurrent {
+		m.running = false
+		m.process = nil
+		m.cmd = nil
+		m.waitErr = err
+	}
 	m.mu.Unlock()
+	close(done)
 
-	// Signal that Wait() has returned.
-	close(m.waitDone)
-
-	select {
-	case <-m.ctx.Done():
-		// Normal shutdown.
+	// A stale monitor must never modify or restart a newer process.
+	if !isCurrent || intentional {
 		return
-	default:
 	}
 
 	if err != nil {
 		m.logger.Error("xray-core exited unexpectedly",
 			"error", err,
-			"uptime", time.Since(m.startedAt).Round(time.Second),
+			"uptime", time.Since(startedAt).Round(time.Second),
 		)
 	} else {
 		m.logger.Warn("xray-core exited",
-			"uptime", time.Since(m.startedAt).Round(time.Second),
+			"uptime", time.Since(startedAt).Round(time.Second),
 		)
 	}
 
-	// Auto-restart after unexpected exit.
-	m.logger.Info("auto-restarting xray-core in 3 seconds")
+	m.logger.Info("auto-restarting xray-core", "delay", m.restartDelay)
+	timer := time.NewTimer(m.restartDelay)
+	defer timer.Stop()
 	select {
-	case <-time.After(3 * time.Second):
-		if err := m.Start(); err != nil {
+	case <-timer.C:
+		if err := m.startIfWanted(); err != nil {
 			m.logger.Error("auto-restart failed", "error", err)
 		}
 	case <-m.ctx.Done():
@@ -322,6 +385,7 @@ func (m *XrayManager) monitor() {
 }
 
 // detectVersion runs `xray version` to capture the installed version.
+// The caller holds mu.
 func (m *XrayManager) detectVersion() {
 	out, err := exec.Command(m.config.XrayPath, "version").Output()
 	if err != nil {

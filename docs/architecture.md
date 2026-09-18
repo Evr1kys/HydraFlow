@@ -1,131 +1,56 @@
 # Architecture
 
-## Overview
+## Implemented server paths
 
-HydraFlow is built around three core principles:
+HydraFlow currently has two subscription servers:
 
-1. **No single point of failure** — Multiple protocols ensure that blocking one method doesn't cut off access
-2. **Automatic adaptation** — The system detects censorship conditions and responds without user intervention
-3. **Community intelligence** — Anonymous, aggregated data from all clients improves protocol selection for everyone
+- `install.sh` configures proxy processes and starts `hydraflow-sub`, built from
+  the self-contained `tools/sub-server.go`. It uses `sub-config.json`.
+- `hydraflow serve` uses `config`, `smartsub`, `xray` and `integrations`. It uses
+  `hydraflow.yaml` and can manage Xray directly or read users/nodes from a panel.
 
-## System Components
+These implementations have different configuration models and are not
+interchangeable. The CLI export command and `smartsub` share client renderers;
+the installer's server still has its own rendering and ISP lookup code.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                        CLIENT SIDE                            │
-│                                                               │
-│  ┌─────────────┐  ┌──────────────┐  ┌─────────────────────┐ │
-│  │ Subscription│  │ Probe Engine │  │ Protocol Selector   │ │
-│  │ Manager     │──│              │──│                     │ │
-│  │             │  │ - Port test  │  │ - Score calculation │ │
-│  │ - Fetch     │  │ - TLS test   │  │ - History tracking  │ │
-│  │ - Cache     │  │ - SNI test   │  │ - ISP matching      │ │
-│  │ - Auto-     │  │ - QUIC test  │  │ - Auto fallback     │ │
-│  │   refresh   │  │ - Fragment   │  │                     │ │
-│  └──────┬──────┘  └──────┬───────┘  └──────────┬──────────┘ │
-│         │                │                      │            │
-│  ┌──────▼────────────────▼──────────────────────▼──────────┐ │
-│  │                    Core Engine                           │ │
-│  │                                                          │ │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │ │
-│  │  │ Reality  │ │  XHTTP   │ │Hysteria2 │ │ShadowTLS │  │ │
-│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘  │ │
-│  │                                                          │ │
-│  │  ┌──────────────────────────────────────────────────┐   │ │
-│  │  │            Connection Monitor                     │   │ │
-│  │  │  - Latency tracking                              │   │ │
-│  │  │  - Throughput measurement                        │   │ │
-│  │  │  - Degradation detection                         │   │ │
-│  │  └──────────────────────────────────────────────────┘   │ │
-│  └──────────────────────────┬───────────────────────────────┘ │
-│                             │                                 │
-│  ┌──────────────────────────▼───────────────────────────────┐ │
-│  │              TUN / SOCKS5 / HTTP Proxy                    │ │
-│  └───────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────┘
-                              │
-                    ══════════╪══════════  (censored network)
-                              │
-┌──────────────────────────────────────────────────────────────┐
-│                        SERVER SIDE                            │
-│                                                               │
-│  ┌──────────────────────────────────────────────────────────┐ │
-│  │                Multi-Protocol Listener                    │ │
-│  │                                                          │ │
-│  │  :443/tcp ──→ nginx SNI router ──→ Reality (xray)       │ │
-│  │                                ──→ ShadowTLS             │ │
-│  │  :443/udp ──→ Hysteria2                                  │ │
-│  │  CDN      ──→ Cloudflare ──→ XHTTP (xray)               │ │
-│  └──────────────────────────────────────────────────────────┘ │
-│                                                               │
-│  ┌─────────────────┐  ┌──────────────────────────────────┐  │
-│  │ Subscription    │  │ Blocking Map Aggregator          │  │
-│  │ Server          │  │                                  │  │
-│  │ - Generate      │  │ - Collect anonymous reports      │  │
-│  │ - Serve configs │  │ - Aggregate by ISP               │  │
-│  │ - Push updates  │  │ - Update subscription configs    │  │
-│  └─────────────────┘  └──────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
-```
+## CLI request flow
 
-## Protocol Selection Algorithm
+1. A provider supplies enabled nodes and their user identities.
+2. The subscription endpoint validates a user-scoped token.
+3. `smartsub.NodesForUser` filters nodes by that exact identity.
+4. ISP lookup selects a static protocol priority list.
+5. Nodes are ordered using server-side availability and ISP priority. Telemetry
+   filters protocols reported blocked, with a fallback if all are blocked.
+6. The server renders V2Ray links, Mihomo YAML or sing-box JSON. Compatible clients
+   perform their own connection tests and selection after importing a config.
 
-The selector uses a weighted scoring system:
+The current algorithm does not implement the previously documented weighted
+50/30/20 client score or a built-in TUN/proxy client. Server-side TCP/TLS checks
+are not evidence that a protocol is reachable from a censored client network.
+In particular they are not valid end-to-end Hysteria2/QUIC checks.
 
-```
-score = probe_score * 0.5 + history_score * 0.3 + priority_score * 0.2
-```
+## Components
 
-Where:
-- **probe_score** (50%) — Results from censorship detection probes
-- **history_score** (30%) — Historical success rate on this network
-- **priority_score** (20%) — Configured priority order
+- `discovery`: probe, fingerprint, blocking map and reporting building blocks.
+- `bypass`: fragmentation, padding, DNS, SNI and other connection techniques.
+- `smartsub`: user filtering, priorities, telemetry, HTTP endpoints and rendering.
+- `integrations`: provider adapters for supported management panels.
+- `xray`: server configuration builder and subprocess management.
+- `config`: configuration defaults and persistent secrets.
 
-The algorithm ensures that:
-1. Protocols that definitely don't work (probes failed) are excluded
-2. Protocols that historically work well are preferred
-3. User-configured priorities serve as a tiebreaker
+The presence of a discovery or bypass component does not imply it participates
+in every subscription request. Full client-side autonomous adaptation and
+cross-deployment aggregation are not wired together by `serve`.
 
-## Data Flow
+## Access and privacy
 
-### Connection Establishment
+CLI subscription tokens are HMAC-SHA256 credentials scoped to a user identity.
+The admin secret is required only for administrative access and local token
+issuance. See [the upgrade guide](upgrade-subscriptions.md) before upgrading.
 
-```
-1. Fetch subscription (cached, refreshed periodically)
-2. Check blocking map for ISP-specific recommendations
-3. Run probe tests (parallel, 2-5 second timeout)
-4. Score and rank available protocols
-5. Attempt connection with highest-ranked protocol
-6. On failure: try next protocol (automatic fallback)
-7. On success: start connection monitor
-8. Report anonymous success/failure to blocking map
-```
-
-### Subscription Update
-
-```
-1. Server detects blocking pattern change (via aggregated reports)
-2. Server updates subscription config (new priorities, new servers)
-3. Client fetches updated config on next refresh interval
-4. Client re-evaluates protocol selection with new data
-```
-
-## Security Architecture
-
-### Threat Model
-
-| Threat | Mitigation |
-|--------|------------|
-| DPI signature detection | Multiple protocols with different signatures |
-| TLS fingerprinting | Chrome-mimicking TLS stack per protocol |
-| IP/ASN correlation | CDN-based protocols use CDN IPs |
-| Active probing | Reality's probe resistance, ShadowTLS real handshake |
-| Traffic analysis | Protocol switching, traffic padding |
-| Server discovery | Subscription tokens, no server IP in DNS |
-
-### Privacy
-
-- Telemetry contains only ISP AS number + protocol status
-- No IP addresses are stored or transmitted
-- Subscription tokens are cryptographically random
-- No correlation between users and traffic patterns is possible
+ISP lookup calls an external service with the client IP, and caches it in memory.
+The CLI engine currently uses HTTP for ip-api.com; the separate installer server
+uses HTTPS. Therefore the old blanket claim that no IP addresses are transmitted
+was incorrect. Log hashing does not anonymize external lookups. Telemetry and
+ISP recommendations should not be treated as an independently verified map of
+censorship conditions.

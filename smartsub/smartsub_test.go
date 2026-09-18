@@ -404,10 +404,10 @@ func TestExtractClientIP(t *testing.T) {
 func TestDetectFormat(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name      string
-		ua        string
-		query     string
-		want      string
+		name  string
+		ua    string
+		query string
+		want  string
 	}{
 		{"query v2ray", "", "format=v2ray", "v2ray"},
 		{"query clash", "", "format=clash", "clash"},
@@ -530,7 +530,7 @@ func TestHandler_SubscriptionOK(t *testing.T) {
 
 	handler := e.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/sub/test-token/user@test.com", nil)
+	req := httptest.NewRequest(http.MethodGet, "/sub/"+SubscriptionToken("test-token", "user@test.com")+"/user@test.com", nil)
 	req.RemoteAddr = "127.0.0.1:1234"
 	rr := httptest.NewRecorder()
 

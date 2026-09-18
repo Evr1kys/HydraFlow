@@ -12,7 +12,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -113,7 +112,7 @@ func NewEngine(cfg EngineConfig) *Engine {
 func (e *Engine) SetNodes(nodes []Node) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.nodes = nodes
+	e.nodes = append([]Node(nil), nodes...)
 	e.logger.Info("nodes updated", "count", len(nodes))
 }
 
@@ -281,13 +280,6 @@ func (e *Engine) handleSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate token.
-	token := parts[0]
-	if subtle.ConstantTimeCompare([]byte(token), []byte(e.token)) != 1 {
-		http.NotFound(w, r)
-		return
-	}
-
 	// Get email from path or query.
 	email := ""
 	if len(parts) > 1 {
@@ -296,6 +288,12 @@ func (e *Engine) handleSubscription(w http.ResponseWriter, r *http.Request) {
 	if email == "" {
 		email = r.URL.Query().Get("email")
 	}
+
+	if !validSubscriptionToken(e.token, email, parts[0]) {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
 
 	clientIP := extractClientIP(r)
 	nodes := e.NodesForUser(email, clientIP)
@@ -320,22 +318,13 @@ func (e *Engine) handleSubscription(w http.ResponseWriter, r *http.Request) {
 	// Exposing it would let network observers fingerprint HydraFlow traffic
 	// and reveal the user's detected ISP.
 
-	// Generate V2Ray base64 links from nodes directly.
-	var links []string
-	for _, n := range nodes {
-		if n.Protocol == "vless" || n.Protocol == "reality" || n.Protocol == "" {
-			link := fmt.Sprintf("vless://%s@%s:%d?type=tcp&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&flow=%s#%s",
-				n.UUID, n.Server, n.Port, n.SNI, n.PublicKey, n.ShortID, n.Flow, n.Name)
-			links = append(links, link)
-		}
-	}
-	if len(links) == 0 {
-		http.Error(w, "no links available", http.StatusNotFound)
+	data, contentType, err := RenderSubscription(nodes, detectFormat(r))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	encoded := base64.StdEncoding.EncodeToString([]byte(strings.Join(links, "\n")))
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Write([]byte(encoded))
+	w.Header().Set("Content-Type", contentType)
+	w.Write(data)
 }
 
 // handleReport processes anonymous telemetry reports from clients.
@@ -382,7 +371,7 @@ func (e *Engine) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate admin token.
-	if subtle.ConstantTimeCompare([]byte(parts[0]), []byte(e.token)) != 1 {
+	if e.token == "" || subtle.ConstantTimeCompare([]byte(parts[0]), []byte(e.token)) != 1 {
 		http.NotFound(w, r)
 		return
 	}

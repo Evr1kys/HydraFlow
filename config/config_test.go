@@ -45,7 +45,7 @@ func TestDefaultConfig_HasCorrectDefaults(t *testing.T) {
 }
 
 func TestLoad_MissingFileReturnsDefaults(t *testing.T) {
-	cfg, err := Load("/nonexistent/path/config.yaml")
+	cfg, err := Load(filepath.Join(t.TempDir(), "new", "config.yaml"))
 	if err != nil {
 		t.Fatalf("Load should not error on missing file: %v", err)
 	}
@@ -249,15 +249,13 @@ func TestSave_Roundtrip(t *testing.T) {
 	}
 }
 
-func TestLoad_EmptyPath_DefaultsToDefaultConfigPath(t *testing.T) {
-	// This just tests that Load("") doesn't panic.
-	// It will return defaults because the default path doesn't exist in test env.
-	cfg, err := Load("")
-	if err != nil {
-		t.Fatalf("Load(''): %v", err)
+func TestLoad_CannotPersistToken(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(parent, []byte("not a directory"), 0600); err != nil {
+		t.Fatal(err)
 	}
-	if cfg == nil {
-		t.Fatal("config should not be nil")
+	if _, err := Load(filepath.Join(parent, "config.yaml")); err == nil {
+		t.Fatal("must fail when the secret cannot be persisted")
 	}
 }
 
@@ -267,7 +265,7 @@ func TestDirOf(t *testing.T) {
 		want string
 	}{
 		{"/etc/hydraflow/config.yaml", "/etc/hydraflow"},
-		{"/config.yaml", ""},
+		{"/config.yaml", "/"},
 		{"config.yaml", "."},
 	}
 
@@ -315,5 +313,34 @@ servers:
 	}
 	if len(cfg.Servers[0].Protocols) != 2 {
 		t.Fatalf("expected 2 protocols, got %d", len(cfg.Servers[0].Protocols))
+	}
+}
+
+func TestLoad_PersistsTokenAndPrivatePermissions(t *testing.T) {
+	for _, contents := range []string{"", "mode: standalone\n"} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if contents != "" {
+			if err := os.WriteFile(path, []byte(contents), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		first, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first.AdminToken == "" || first.AdminToken != second.AdminToken {
+			t.Fatal("secret changed on reload")
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Fatalf("secret file mode = %o", info.Mode().Perm())
+		}
 	}
 }

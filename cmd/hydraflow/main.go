@@ -143,8 +143,7 @@ func cmdStatus() {
 		fmt.Printf("  API URL: %s\n", cfg.Marzban.APIURL)
 	}
 
-	fmt.Printf("\n  Sub URL: http://<server>:%s/sub/%s\n",
-		portFromListen(cfg.Listen), cfg.AdminToken)
+	fmt.Println("\n  Issue a subscription: hydraflow user sub <email>")
 }
 
 func printUsage() {
