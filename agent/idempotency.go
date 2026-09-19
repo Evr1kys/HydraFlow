@@ -25,10 +25,10 @@ type cachedResponse struct {
 
 // IdempotencyStore persists successful mutation responses across restarts.
 type IdempotencyStore struct {
-	mu   sync.Mutex
-	dir  string
-	ttl  time.Duration
-	now  func() time.Time
+	mu  sync.Mutex
+	dir string
+	ttl time.Duration
+	now func() time.Time
 }
 
 func NewIdempotencyStore(dir string, ttl time.Duration) (*IdempotencyStore, error) {

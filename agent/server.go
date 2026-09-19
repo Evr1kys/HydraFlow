@@ -23,20 +23,20 @@ const idempotencyHeader = "Idempotency-Key"
 
 // ServerConfig controls the hardened Agent API server.
 type ServerConfig struct {
-	ListenAddress string
-	TLSCertFile   string
-	TLSKeyFile    string
-	ClientCAFile  string
-	KeyFile       string
-	XrayConfig    string
-	StateDir      string
-	AuditLog      string
-	StatsAddress  string
-	Version       string
-	BuildTime     string
-	MaxBodyBytes  int64
-	MaxHistory    int
-	ReplayWindow  time.Duration
+	ListenAddress  string
+	TLSCertFile    string
+	TLSKeyFile     string
+	ClientCAFile   string
+	KeyFile        string
+	XrayConfig     string
+	StateDir       string
+	AuditLog       string
+	StatsAddress   string
+	Version        string
+	BuildTime      string
+	MaxBodyBytes   int64
+	MaxHistory     int
+	ReplayWindow   time.Duration
 	IdempotencyTTL time.Duration
 }
 
