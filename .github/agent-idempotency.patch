@@ -1,0 +1,229 @@
+diff --git a/agent/idempotency.go b/agent/idempotency.go
+index 2512b72..6ecb05b 100644
+--- a/agent/idempotency.go
++++ b/agent/idempotency.go
+@@ -15,6 +15,11 @@ import (
+ 
+ var idempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{16,128}$`)
+ 
++type idempotencyKeyLock struct {
++	mu   sync.Mutex
++	refs int
++}
++
+ type cachedResponse struct {
+ 	RequestHash string          `json:"request_hash"`
+ 	Status      int             `json:"status"`
+@@ -29,6 +34,9 @@ type IdempotencyStore struct {
+ 	dir string
+ 	ttl time.Duration
+ 	now func() time.Time
++
++	locksMu sync.Mutex
++	locks   map[string]*idempotencyKeyLock
+ }
+ 
+ func NewIdempotencyStore(dir string, ttl time.Duration) (*IdempotencyStore, error) {
+@@ -41,11 +49,48 @@ func NewIdempotencyStore(dir string, ttl time.Duration) (*IdempotencyStore, erro
+ 	if err := os.Chmod(dir, 0700); err != nil {
+ 		return nil, fmt.Errorf("secure idempotency directory: %w", err)
+ 	}
+-	store := &IdempotencyStore{dir: dir, ttl: ttl, now: time.Now}
++	store := &IdempotencyStore{
++		dir:   dir,
++		ttl:   ttl,
++		now:   time.Now,
++		locks: make(map[string]*idempotencyKeyLock),
++	}
+ 	_ = store.Cleanup()
+ 	return store, nil
+ }
+ 
++// Acquire serializes concurrent mutations using the same idempotency key.
++// The returned release function must always be called. Different keys remain
++// independent, so an unrelated deployment cannot block this request.
++func (s *IdempotencyStore) Acquire(key string) (func(), error) {
++	if !idempotencyKeyPattern.MatchString(key) {
++		return nil, apiError(400, "invalid_idempotency_key", "Idempotency-Key must contain 16-128 safe characters", nil)
++	}
++
++	s.locksMu.Lock()
++	lock := s.locks[key]
++	if lock == nil {
++		lock = &idempotencyKeyLock{}
++		s.locks[key] = lock
++	}
++	lock.refs++
++	s.locksMu.Unlock()
++
++	lock.mu.Lock()
++	var once sync.Once
++	return func() {
++		once.Do(func() {
++			lock.mu.Unlock()
++			s.locksMu.Lock()
++			lock.refs--
++			if lock.refs == 0 && s.locks[key] == lock {
++				delete(s.locks, key)
++			}
++			s.locksMu.Unlock()
++		})
++	}, nil
++}
++
+ // Get returns a cached response. conflict is true when the same idempotency key
+ // was reused with a different request body.
+ func (s *IdempotencyStore) Get(key, requestHash string) (response cachedResponse, found, conflict bool, err error) {
+diff --git a/agent/server.go b/agent/server.go
+index 7d32d70..261f098 100644
+--- a/agent/server.go
++++ b/agent/server.go
+@@ -391,6 +391,14 @@ func (s *Server) idempotentMutation(w http.ResponseWriter, r *http.Request, acti
+ 	principal := principalFromContext(r.Context())
+ 	key := r.Header.Get(idempotencyHeader)
+ 	requestHash := bodyHashFromContext(r.Context())
++	release, err := s.idem.Acquire(key)
++	if err != nil {
++		s.writeAudit(r, action, false, 400, "", asAPIError(err).Code)
++		writeAPIError(w, requestID, err)
++		return
++	}
++	defer release()
++
+ 	cached, found, conflict, err := s.idem.Get(key, requestHash)
+ 	if err != nil {
+ 		s.writeAudit(r, action, false, 400, "", asAPIError(err).Code)
+diff --git a/agent/server_test.go b/agent/server_test.go
+index c49eed4..f56ec44 100644
+--- a/agent/server_test.go
++++ b/agent/server_test.go
+@@ -20,11 +20,14 @@ import (
+ )
+ 
+ type fakeController struct {
+-	mu           sync.Mutex
+-	active       bool
+-	restarts     int
+-	failNext     bool
+-	validateFail bool
++	mu             sync.Mutex
++	active         bool
++	restarts       int
++	failNext       bool
++	validateFail   bool
++	restartStarted chan struct{}
++	restartRelease <-chan struct{}
++	restartOnce    sync.Once
+ }
+ 
+ func (f *fakeController) Validate(_ context.Context, configPath string) error {
+@@ -38,12 +41,29 @@ func (f *fakeController) Validate(_ context.Context, configPath string) error {
+ 	return nil
+ }
+ 
+-func (f *fakeController) Restart(_ context.Context) error {
++func (f *fakeController) Restart(ctx context.Context) error {
+ 	f.mu.Lock()
+-	defer f.mu.Unlock()
+ 	f.restarts++
+-	if f.failNext {
+-		f.failNext = false
++	fail := f.failNext
++	f.failNext = false
++	started := f.restartStarted
++	release := f.restartRelease
++	f.mu.Unlock()
++
++	if started != nil {
++		f.restartOnce.Do(func() { close(started) })
++	}
++	if release != nil {
++		select {
++		case <-release:
++		case <-ctx.Done():
++			return ctx.Err()
++		}
++	}
++
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	if fail {
+ 		f.active = false
+ 		return io.ErrClosedPipe
+ 	}
+@@ -164,6 +184,75 @@ func TestApplyIsIdempotentAndFailedRestartRollsBack(t *testing.T) {
+ 	}
+ }
+ 
++func TestConcurrentApplyWithSameIdempotencyKeyExecutesOnce(t *testing.T) {
++	restartStarted := make(chan struct{})
++	restartRelease := make(chan struct{})
++	controller := &fakeController{
++		restartStarted: restartStarted,
++		restartRelease: restartRelease,
++	}
++	server, keyID, secret, _ := newTestServer(
++		t,
++		controller,
++		[]byte(`{"inbounds":[],"outbounds":[]}`),
++	)
++	candidate := []byte(`{"log":{"loglevel":"error"},"inbounds":[],"outbounds":[]}`)
++	body := mustJSON(t, map[string]any{"config": json.RawMessage(candidate), "reason": "concurrent apply"})
++	const idempotencyKey = "idem-concurrent-apply-0001"
++
++	firstRequest := signedRequest(t, http.MethodPost, "/api/v1/config/apply", body, keyID, secret, "nonce-concurrent-0001", idempotencyKey)
++	firstResponse := httptest.NewRecorder()
++	firstDone := make(chan struct{})
++	go func() {
++		defer close(firstDone)
++		server.Handler().ServeHTTP(firstResponse, firstRequest)
++	}()
++
++	select {
++	case <-restartStarted:
++	case <-time.After(2 * time.Second):
++		t.Fatal("first request did not enter Xray restart")
++	}
++
++	secondRequest := signedRequest(t, http.MethodPost, "/api/v1/config/apply", body, keyID, secret, "nonce-concurrent-0002", idempotencyKey)
++	secondResponse := httptest.NewRecorder()
++	secondDone := make(chan struct{})
++	go func() {
++		defer close(secondDone)
++		server.Handler().ServeHTTP(secondResponse, secondRequest)
++	}()
++
++	time.Sleep(50 * time.Millisecond)
++	if count := controller.restartCount(); count != 1 {
++		t.Fatalf("concurrent retry executed mutation before first completed: restarts=%d", count)
++	}
++	close(restartRelease)
++
++	select {
++	case <-firstDone:
++	case <-time.After(2 * time.Second):
++		t.Fatal("first request did not complete")
++	}
++	select {
++	case <-secondDone:
++	case <-time.After(2 * time.Second):
++		t.Fatal("second request did not complete")
++	}
++
++	if firstResponse.Code != http.StatusOK {
++		t.Fatalf("first request status=%d body=%s", firstResponse.Code, firstResponse.Body.String())
++	}
++	if secondResponse.Code != http.StatusOK {
++		t.Fatalf("second request status=%d body=%s", secondResponse.Code, secondResponse.Body.String())
++	}
++	if secondResponse.Header().Get("X-Idempotent-Replay") != "true" {
++		t.Fatalf("second request was not served as replay: headers=%v", secondResponse.Header())
++	}
++	if count := controller.restartCount(); count != 1 {
++		t.Fatalf("concurrent idempotent requests restarted Xray %d times", count)
++	}
++}
++
+ func TestKeyRotationAcceptsNewKeyAndGraceKey(t *testing.T) {
+ 	server, keyID, secret, _ := newTestServer(t, &fakeController{}, []byte(`{"inbounds":[],"outbounds":[]}`))
+ 	newSecret := bytes.Repeat([]byte{0x77}, 32)
