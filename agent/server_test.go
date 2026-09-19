@@ -83,14 +83,14 @@ func newTestServer(t *testing.T, controller *fakeController, initial []byte) (*S
 	}
 	controller.active = true
 	server, err := NewServer(ServerConfig{
-		KeyFile:       keyPath,
-		XrayConfig:    currentPath,
-		StateDir:      filepath.Join(dir, "state"),
-		AuditLog:      filepath.Join(dir, "log", "audit.jsonl"),
-		Version:       "test",
-		BuildTime:     "test",
-		ReplayWindow:  time.Minute,
-		MaxBodyBytes:  1 << 20,
+		KeyFile:        keyPath,
+		XrayConfig:     currentPath,
+		StateDir:       filepath.Join(dir, "state"),
+		AuditLog:       filepath.Join(dir, "log", "audit.jsonl"),
+		Version:        "test",
+		BuildTime:      "test",
+		ReplayWindow:   time.Minute,
+		MaxBodyBytes:   1 << 20,
 		IdempotencyTTL: time.Hour,
 	}, controller, nil)
 	if err != nil {
@@ -168,8 +168,8 @@ func TestKeyRotationAcceptsNewKeyAndGraceKey(t *testing.T) {
 	server, keyID, secret, _ := newTestServer(t, &fakeController{}, []byte(`{"inbounds":[],"outbounds":[]}`))
 	newSecret := bytes.Repeat([]byte{0x77}, 32)
 	body := mustJSON(t, map[string]any{
-		"key_id":       "test-key-002",
-		"secret":       base64.RawStdEncoding.EncodeToString(newSecret),
+		"key_id":        "test-key-002",
+		"secret":        base64.RawStdEncoding.EncodeToString(newSecret),
 		"grace_seconds": 60,
 	})
 	request := signedRequest(t, http.MethodPost, "/api/v1/auth/rotate", body, keyID, secret, "nonce-rotate-0001", "idem-rotate-0000001")
