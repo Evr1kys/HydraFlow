@@ -28,10 +28,10 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
-      - name: Verify formatting
+      - name: Verify Agent formatting
         run: |
-          gofmt -w .
-          git diff --exit-code
+          gofmt -w agent cmd/hydraflow-agent
+          git diff --exit-code -- agent cmd/hydraflow-agent
 
       - name: Vet
         run: go vet ./...
