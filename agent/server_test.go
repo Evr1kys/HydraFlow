@@ -20,11 +20,14 @@ import (
 )
 
 type fakeController struct {
-	mu           sync.Mutex
-	active       bool
-	restarts     int
-	failNext     bool
-	validateFail bool
+	mu             sync.Mutex
+	active         bool
+	restarts       int
+	failNext       bool
+	validateFail   bool
+	restartStarted chan struct{}
+	restartRelease <-chan struct{}
+	restartOnce    sync.Once
 }
 
 func (f *fakeController) Validate(_ context.Context, configPath string) error {
@@ -38,12 +41,29 @@ func (f *fakeController) Validate(_ context.Context, configPath string) error {
 	return nil
 }
 
-func (f *fakeController) Restart(_ context.Context) error {
+func (f *fakeController) Restart(ctx context.Context) error {
+	f.mu.Lock()
+	f.restarts++
+	fail := f.failNext
+	f.failNext = false
+	started := f.restartStarted
+	release := f.restartRelease
+	f.mu.Unlock()
+
+	if started != nil {
+		f.restartOnce.Do(func() { close(started) })
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.restarts++
-	if f.failNext {
-		f.failNext = false
+	if fail {
 		f.active = false
 		return io.ErrClosedPipe
 	}
@@ -161,6 +181,75 @@ func TestApplyIsIdempotentAndFailedRestartRollsBack(t *testing.T) {
 	}
 	if !bytes.Equal(current, candidate) {
 		t.Fatalf("rollback did not restore previous config: %s", current)
+	}
+}
+
+func TestConcurrentApplyWithSameIdempotencyKeyExecutesOnce(t *testing.T) {
+	restartStarted := make(chan struct{})
+	restartRelease := make(chan struct{})
+	controller := &fakeController{
+		restartStarted: restartStarted,
+		restartRelease: restartRelease,
+	}
+	server, keyID, secret, _ := newTestServer(
+		t,
+		controller,
+		[]byte(`{"inbounds":[],"outbounds":[]}`),
+	)
+	candidate := []byte(`{"log":{"loglevel":"error"},"inbounds":[],"outbounds":[]}`)
+	body := mustJSON(t, map[string]any{"config": json.RawMessage(candidate), "reason": "concurrent apply"})
+	const idempotencyKey = "idem-concurrent-apply-0001"
+
+	firstRequest := signedRequest(t, http.MethodPost, "/api/v1/config/apply", body, keyID, secret, "nonce-concurrent-0001", idempotencyKey)
+	firstResponse := httptest.NewRecorder()
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		server.Handler().ServeHTTP(firstResponse, firstRequest)
+	}()
+
+	select {
+	case <-restartStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not enter Xray restart")
+	}
+
+	secondRequest := signedRequest(t, http.MethodPost, "/api/v1/config/apply", body, keyID, secret, "nonce-concurrent-0002", idempotencyKey)
+	secondResponse := httptest.NewRecorder()
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		server.Handler().ServeHTTP(secondResponse, secondRequest)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if count := controller.restartCount(); count != 1 {
+		t.Fatalf("concurrent retry executed mutation before first completed: restarts=%d", count)
+	}
+	close(restartRelease)
+
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not complete")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second request did not complete")
+	}
+
+	if firstResponse.Code != http.StatusOK {
+		t.Fatalf("first request status=%d body=%s", firstResponse.Code, firstResponse.Body.String())
+	}
+	if secondResponse.Code != http.StatusOK {
+		t.Fatalf("second request status=%d body=%s", secondResponse.Code, secondResponse.Body.String())
+	}
+	if secondResponse.Header().Get("X-Idempotent-Replay") != "true" {
+		t.Fatalf("second request was not served as replay: headers=%v", secondResponse.Header())
+	}
+	if count := controller.restartCount(); count != 1 {
+		t.Fatalf("concurrent idempotent requests restarted Xray %d times", count)
 	}
 }
 

@@ -391,6 +391,14 @@ func (s *Server) idempotentMutation(w http.ResponseWriter, r *http.Request, acti
 	principal := principalFromContext(r.Context())
 	key := r.Header.Get(idempotencyHeader)
 	requestHash := bodyHashFromContext(r.Context())
+	release, err := s.idem.Acquire(key)
+	if err != nil {
+		s.writeAudit(r, action, false, 400, "", asAPIError(err).Code)
+		writeAPIError(w, requestID, err)
+		return
+	}
+	defer release()
+
 	cached, found, conflict, err := s.idem.Get(key, requestHash)
 	if err != nil {
 		s.writeAudit(r, action, false, 400, "", asAPIError(err).Code)
