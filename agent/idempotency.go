@@ -15,6 +15,11 @@ import (
 
 var idempotencyKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{16,128}$`)
 
+type idempotencyKeyLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
 type cachedResponse struct {
 	RequestHash string          `json:"request_hash"`
 	Status      int             `json:"status"`
@@ -29,6 +34,9 @@ type IdempotencyStore struct {
 	dir string
 	ttl time.Duration
 	now func() time.Time
+
+	locksMu sync.Mutex
+	locks   map[string]*idempotencyKeyLock
 }
 
 func NewIdempotencyStore(dir string, ttl time.Duration) (*IdempotencyStore, error) {
@@ -41,9 +49,46 @@ func NewIdempotencyStore(dir string, ttl time.Duration) (*IdempotencyStore, erro
 	if err := os.Chmod(dir, 0700); err != nil {
 		return nil, fmt.Errorf("secure idempotency directory: %w", err)
 	}
-	store := &IdempotencyStore{dir: dir, ttl: ttl, now: time.Now}
+	store := &IdempotencyStore{
+		dir:   dir,
+		ttl:   ttl,
+		now:   time.Now,
+		locks: make(map[string]*idempotencyKeyLock),
+	}
 	_ = store.Cleanup()
 	return store, nil
+}
+
+// Acquire serializes concurrent mutations using the same idempotency key.
+// The returned release function must always be called. Different keys remain
+// independent, so an unrelated deployment cannot block this request.
+func (s *IdempotencyStore) Acquire(key string) (func(), error) {
+	if !idempotencyKeyPattern.MatchString(key) {
+		return nil, apiError(400, "invalid_idempotency_key", "Idempotency-Key must contain 16-128 safe characters", nil)
+	}
+
+	s.locksMu.Lock()
+	lock := s.locks[key]
+	if lock == nil {
+		lock = &idempotencyKeyLock{}
+		s.locks[key] = lock
+	}
+	lock.refs++
+	s.locksMu.Unlock()
+
+	lock.mu.Lock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			lock.mu.Unlock()
+			s.locksMu.Lock()
+			lock.refs--
+			if lock.refs == 0 && s.locks[key] == lock {
+				delete(s.locks, key)
+			}
+			s.locksMu.Unlock()
+		})
+	}, nil
 }
 
 // Get returns a cached response. conflict is true when the same idempotency key
