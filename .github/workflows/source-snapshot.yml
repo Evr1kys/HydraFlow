@@ -1,0 +1,23 @@
+name: Source Snapshot
+
+on:
+  push:
+    branches:
+      - work/source-snapshot-20260919
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create source archive
+        run: tar --exclude=.git -czf hydraflow-source.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hydraflow-source
+          path: hydraflow-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
