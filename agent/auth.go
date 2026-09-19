@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -85,6 +85,9 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 		w.Header().Set(headerRequestID, requestID)
 		ctx := context.WithValue(r.Context(), requestIDContextKey, requestID)
 
+		if r.Body == nil {
+			r.Body = http.NoBody
+		}
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, a.maxBody))
 		if err != nil {
 			writeAPIError(w, requestID, apiError(http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds configured limit", err))
@@ -188,7 +191,10 @@ func validOpaqueToken(value string, minimum, maximum int) bool {
 }
 
 func randomRequestID() string {
-	now := time.Now().UTC().UnixNano()
-	digest := sha256.Sum256([]byte(fmt.Sprintf("%d:%d", now, time.Now().UnixNano())))
+	value := make([]byte, 12)
+	if _, err := rand.Read(value); err == nil {
+		return hex.EncodeToString(value)
+	}
+	digest := sha256.Sum256([]byte(strconv.FormatInt(time.Now().UnixNano(), 10)))
 	return hex.EncodeToString(digest[:12])
 }
