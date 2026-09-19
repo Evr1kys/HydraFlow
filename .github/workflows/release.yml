@@ -7,6 +7,7 @@ on:
 permissions:
   contents: write
   packages: write
+  id-token: write
 
 jobs:
   build-and-release:
@@ -18,31 +19,50 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version: '1.22'
+          cache: true
 
       - name: Build binaries
         run: |
+          set -euo pipefail
           VERSION=${GITHUB_REF_NAME}
-          LDFLAGS="-s -w -X main.version=${VERSION}"
-
+          BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}"
           mkdir -p dist
 
-          # CLI
-          GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/hydraflow-linux-amd64 ./cmd/hydraflow/
-          GOOS=linux GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/hydraflow-linux-arm64 ./cmd/hydraflow/
-          GOOS=darwin GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/hydraflow-darwin-amd64 ./cmd/hydraflow/
-          GOOS=darwin GOARCH=arm64 go build -ldflags "$LDFLAGS" -o dist/hydraflow-darwin-arm64 ./cmd/hydraflow/
-          GOOS=windows GOARCH=amd64 go build -ldflags "$LDFLAGS" -o dist/hydraflow-windows-amd64.exe ./cmd/hydraflow/
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/hydraflow-linux-amd64 ./cmd/hydraflow/
+          GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/hydraflow-linux-arm64 ./cmd/hydraflow/
+          GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/hydraflow-darwin-amd64 ./cmd/hydraflow/
+          GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/hydraflow-darwin-arm64 ./cmd/hydraflow/
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/hydraflow-windows-amd64.exe ./cmd/hydraflow/
 
-          # Subscription server
-          GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o dist/hydraflow-sub-linux-amd64 ./tools/sub-server.go
-          GOOS=linux GOARCH=arm64 go build -ldflags "-s -w" -o dist/hydraflow-sub-linux-arm64 ./tools/sub-server.go
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/hydraflow-agent-linux-amd64 ./cmd/hydraflow-agent/
+          GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/hydraflow-agent-linux-arm64 ./cmd/hydraflow-agent/
+
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/hydraflow-sub-linux-amd64 ./tools/sub-server.go
+          GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/hydraflow-sub-linux-arm64 ./tools/sub-server.go
+
+          (cd dist && sha256sum hydraflow* > SHA256SUMS)
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksum manifest with GitHub OIDC
+        run: cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+
+      - name: Verify checksum manifest signature
+        run: |
+          cosign verify-blob \
+            --bundle dist/SHA256SUMS.sigstore.json \
+            --certificate-identity-regexp '^https://github.com/Evr1kys/HydraFlow/.github/workflows/release.yml@refs/tags/v' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            dist/SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') }}
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
 
   docker:
     runs-on: ubuntu-latest
@@ -63,4 +83,4 @@ jobs:
           push: true
           tags: |
             ghcr.io/evr1kys/hydraflow:${{ github.ref_name }}
-            ghcr.io/evr1kys/hydraflow:latest
+            ghcr.io/evr1kys/hydraflow:${{ github.sha }}
